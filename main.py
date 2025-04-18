@@ -1,88 +1,121 @@
 import os
+import urllib.parse
+import requests
 
-from flask import Flask, session, request, redirect, url_for
+
+from datetime import datetime, timedelta
+from flask import Flask, session, request, redirect, jsonify
 
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.cache_handler import FlaskSessionCacheHandler
 
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.urandom(24)  # Set a random secret key for session management
+app.secret_key = '53dalfjaf-adflkja-123124123-123124'
+# app.config["SECRET_KEY"] = os.urandom(24)  # Set a random secret key for session management
 
-client_id="b1d1a53c290c4c4b9dc855b81887dd74"
-client_secret="344a4d6c0da84a0ea109df5b952133ee"
-redirect_uri = "http://localhost:5000/callback" 
-scope = 'playlist-read-private'  # Replace with the desired scope
+CLIENT_ID="b1d1a53c290c4c4b9dc855b81887dd74"
+CLIENT_SECRET="344a4d6c0da84a0ea109df5b952133ee"
+REDIRECT_URI = "http://localhost:5000/callback" 
 
-# Set up Spotipy OAuth object
-cache_handler = FlaskSessionCacheHandler(session)
-sp_oauth = SpotifyOAuth(
-    client_id=client_id,
-    client_secret=client_secret,
-    redirect_uri=redirect_uri,
-    scope=scope,
-    cache_handler=cache_handler,
-    show_dialog=True,
-)
+AUTH_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
 
-# Create the Spotify client using this auth manager
-sp = Spotify(auth_manager=sp_oauth)
+API_BASE_URL = "https://api.spotify.com/v1/"
 
 @app.route("/")
-def home():
-    """
-    Check if we have a valid token. If not, redirect to Spotify's authorization URL.
-    """
-    token_info = sp_oauth.validate_token(cache_handler.get_cached_token())
-    if not token_info:
-        auth_url = sp_oauth.get_authorize_url()
-        return redirect(auth_url)
-    return redirect(url_for("get_playlists"))
+def index():
+    return "Welcome to the Spotify API Flask App! <br> <a href='/login'>Login with Spotify</a>"
 
+@app.route("/login")
+def login():
+
+    scope = 'user-read-private user-read-email'  # Replace with the desired scope
+
+    params = {
+    'client_id' : CLIENT_ID,
+    'response_type' : 'code',
+    'scope' : scope,
+    'client_secret' : CLIENT_SECRET,
+    'redirect_uri' : REDIRECT_URI,
+    'show_dialog' : True
+    }
+
+    auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+    return redirect(auth_url)
 
 @app.route("/callback")
 def callback():
-    """
-    After Spotify's OAuth flow, the user is redirected here with a 'code' in the URL.
-    Exchange the code for an access token and store it using FlaskSessionCacheHandler.
-    """
-    code = request.args.get("code")
-    if code:
-        sp_oauth.get_access_token(code)  # This auto-saves to the session via cache_handler
-    return redirect(url_for("get_playlists"))
+    if 'error' in request.args:
+        return jsonify({"error": request.args["error"]})
+    if 'code' in request.args:
+        req_body = {
+            'code': request.args['code'],
+            'grant_type': 'authorization_code',
+            'redirect_uri': REDIRECT_URI,
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET
+        }
 
+        response = requests.post(TOKEN_URL, data=req_body)
+        token_info = response.json()
 
-@app.route("/get_playlists")
+        session['access_token'] = token_info['access_token']
+        session['refresh_token'] = token_info['refresh_token']
+        session['expires_at'] = datetime.now().timestamp() + token_info['expires_in']
+
+        return redirect('/playlists')
+
+@app.route("/playlists")
 def get_playlists():
-    """
-    Example route to display the user's playlists. If the token is invalid or expired,
-    re-authenticate the user.
-    """
-    token_info = sp_oauth.validate_token(cache_handler.get_cached_token())
-    if not token_info:
-        return redirect(sp_oauth.get_authorize_url())
 
-    try:
-        playlists = sp.current_user_playlists(limit=10)
-    except Exception as e:
-        print("Error fetching playlists:", e)
-        return f"Error: {e}"
+    if 'access_token' not in session:
+        return redirect('/login')
 
-    # Build a simple HTML string of playlist names and URLs
-    playlist_info = [(pl["name"], pl["external_urls"]["spotify"]) for pl in playlists["items"]]
-    playlist_html = "<br>".join([f"{name}: {url}" for name, url in playlist_info])
+    if datetime.now().timestamp() > session['expires_at']:
+        return redirect('/refresh-token')
+    
+    headers = {
+        'Authorization': f'Bearer {session['access_token']}'
+    }
 
-    return f"<h3>Your Playlists:</h3><p>{playlist_html}</p>"
+    response = requests.get(API_BASE_URL + 'me/playlists', headers=headers)
+    playlists = response.json()
 
+    return jsonify(playlists)
 
-@app.route("/logout")
-def logout():
-    """
-    Clear the session and token, forcing a new login on the next request.
-    """
-    session.clear()
-    return redirect(url_for("home"))
+@app.route("/refresh-token")
+def refresh_token():
+    if 'refresh_token' not in session:
+        return redirect('/login')
+
+    if datetime.now().timestamp() > session['expires_at']:
+        print("Token expired, refreshing...")
+        req_body = {
+            'grant_type': 'refresh_token',
+            'refresh_token': session['refresh_token'],
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET
+        }
+
+    response = requests.post(TOKEN_URL, data=req_body)
+    new_token_info = response.json()
+
+    session['access_token'] = new_token_info['access_token']
+    session['expires_at'] = datetime.now().timestamp() + new_token_info['expires_in']
+
+    return redirect('/playlists')
+
+# @app.route("/logout")
+# def logout():
+#     """
+#     Clear the session and token, forcing a new login on the next request.
+#     """
+#     session.clear()
+#     return redirect(url_for("home"))
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host='0.0.0.0', debug=True)
